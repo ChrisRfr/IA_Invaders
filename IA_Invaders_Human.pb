@@ -1,0 +1,701 @@
+; ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+; IA_Invaders - PurePunch Halloween 2026.;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+; Fred, the last human developer, fights AI-generated bugs.;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+; Pure PureBasic: no API, no external library.;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+; Keys: LEFT / RIGHT = move, SPACE = fire, ESC = quit.;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+; ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+EnableExplicit
+
+; ---------- TUNING: change these values to adjust the game ----------
+#LIVES = 5                 ; Fred's lives
+#MAX_WAVE = 5              ; number of waves to survive
+#PLAYER_SPEED = 5          ; Fred speed (pixels per frame)
+#FIRE_DELAY = 320          ; ms between two Fred shots (bigger = harder)
+#MAX_SHOTS = 3             ; Fred bullets on screen at the same time (smaller = harder)
+#STEP_PIXELS = 8           ; armada horizontal move per step
+#STEP_BASE = 36            ; armada step delay in ms (smaller = faster)
+#STEP_PER_ENEMY = 10        ; + ms per living enemy (smaller = less acceleration as the armada empties)
+#STEP_MIN = 14             ; fastest possible step delay in ms
+#WAVE_SPEEDUP = 10         ; armada gets this % faster at each wave
+#DROP = 20                 ; one "line" = 20 pixels
+#BOMB_DELAY_MAX = 1200     ; ms between enemy shots: random between MIN and MAX
+#BOMB_DELAY_MIN = 500
+#BOMB_WAVE_FASTER = 70    ; MAX delay is reduced by this value at each wave
+#BOMB_SPEED = 4            ; bomb speed (+1 every 3 waves)
+#BURST_EVERY = 3           ; +1 bomb per enemy shot every N waves
+#AIM_PERCENT = 30          ; % of bombs dropped in Fred's column
+#MERGE_BOOST = 1500        ; ms of armada panic after a Git Commit dies
+#CASH_SPEED = 1.4          ; CEO Cash speed (pixels per frame)
+#CASH_HITS = 3             ; shots needed to kill the CEO
+#CASH_DELAY_MIN = 9000     ; ms before the CEO comes back (random between MIN and MAX)
+#CASH_DELAY_MAX = 15000
+#MEGA_SPEED = 1.2          ; MegaCenter speed (pixels per frame)
+#MEGA_HITS = 2             ; shots needed to kill the MegaCenter
+#MEGA_DELAY_MIN = 14000
+#MEGA_DELAY_MAX = 22000
+#BOLT_WARN = 800           ; ms of warning before the lightning strikes
+#BOLT_STRIKE = 220         ; ms the lightning stays on screen
+#BOLT_COOLDOWN = 1800      ; ms between two lightnings
+#BUG_REBORN = 8            ; 1 chance in N that a dead Bug is "fixed by AI" (a new Bug flies back)
+#REBORN_MS = 1800          ; ms for the new Bug to fly back to the armada
+#HALLU_CHANCE = 5          ; 1 Git Commit shot in N is a harmless hallucination (cyan)
+#SHIELD_MS = 6000          ; rubber duck shield duration in ms
+#PTS_BUG = 10
+#PTS_KNOT = 30
+#PTS_COMMIT = 20
+#PTS_CASH = 150
+#PTS_MEGA = 250
+
+; ---------- layout ----------
+#SW = 800 : #SH = 600
+#COLS = 8 : #ROWS = 3
+#CELL_W = 64 : #ROW_H = 50
+#CASH_Y = 30               ; lane of the CEO Cash (top of the screen)
+#AY_START = 84             ; armada start height
+#AY_MIN = 76               ; the armada can not go higher than this
+#LOSE_Y = 470              ; armada reaching this line = system crash (painted in background.png)
+#PLAYER_Y = #SH - 76
+#SP_CASH = 0 : #SP_MEGA = 1
+
+Enumeration
+  #Spr_BG
+  #Spr_Enemies
+  #Spr_Player
+EndEnumeration
+
+Enumeration
+  #Snd_Shoot
+  #Snd_Explosion
+  #Snd_Music
+EndEnumeration
+
+Enumeration
+  #St_Boot
+  #St_Title
+  #St_Play
+  #St_Over
+  #St_Win
+EndEnumeration
+
+Structure TShot
+  x.f
+  y.f
+  act.b
+EndStructure
+
+Structure TBoom
+  x.l
+  y.l
+  kind.b
+  t.l
+EndStructure
+
+Global Dim hp.b(#ROWS - 1, #COLS - 1)
+Global Dim shot.TShot(#MAX_SHOTS - 1)
+Global Dim bomb.TShot(15)
+Global Dim boom.TBoom(31)
+Global Dim spOn(1)
+Global Dim spX.f(1)
+Global Dim spY(1)
+Global Dim spHp(1)
+Global Dim spHit(1)
+Global Dim spNext(1)
+
+Global state, score, hiscore, lives, wave, ax, ay, dir, frame, alive
+Global nextStep, nextBomb, nextShot, boostUntil, hitUntil, invUntil
+Global msgUntil, fireUntil, lock, hasSound, gMinC, gMaxC, gMaxR, moving
+Global bState, bUntil, bCool, bHit, overAt, bootAt, duckOn, shieldUntil, rbOn, rbCol, rbStart, rbSX, rbSY, rbBend
+Global px.f, bX.f, duckX.f, duckY.f, rbX.f, rbY.f
+Global msg$, quotes$
+
+Macro Hit(x1, y1, w1, h1, x2, y2, w2, h2)
+  Bool((x1) < (x2) + (w2) And (x1) + (w1) > (x2) And (y1) < (y2) + (h2) And (y1) + (h1) > (y2))
+EndMacro
+
+; ---------- helpers ----------
+Procedure Need(ok, file$)
+  If ok = 0 : MessageRequester("IA Invaders", "Missing resource: " + file$) : End : EndIf
+EndProcedure
+
+Procedure Sfx(n)
+  If hasSound : PlaySound(n, #PB_Sound_MultiChannel) : EndIf
+EndProcedure
+
+Procedure Say(text$, ms = 1600)
+  msg$ = text$
+  msgUntil = ElapsedMilliseconds() + ms
+EndProcedure
+
+Procedure AddBoom(x, y, kind)
+  Protected i, now = ElapsedMilliseconds()
+  For i = 0 To 31
+    If boom(i)\t < now
+      boom(i)\x = x : boom(i)\y = y : boom(i)\kind = kind : boom(i)\t = now + 250
+      Break
+    EndIf
+  Next
+EndProcedure
+
+Procedure SetNext(k)
+  If k = #SP_CASH
+    spNext(k) = ElapsedMilliseconds() + Random(#CASH_DELAY_MAX, #CASH_DELAY_MIN)
+  Else
+    spNext(k) = ElapsedMilliseconds() + Random(#MEGA_DELAY_MAX, #MEGA_DELAY_MIN)
+  EndIf
+EndProcedure
+
+; occupied area of the armada
+Procedure Scan()
+  Protected r, c
+  gMinC = #COLS : gMaxC = -1 : gMaxR = -1
+  For r = 0 To #ROWS - 1
+    For c = 0 To #COLS - 1
+      If hp(r, c)
+        If c < gMinC : gMinC = c : EndIf
+        If c > gMaxC : gMaxC = c : EndIf
+        If r > gMaxR : gMaxR = r : EndIf
+      EndIf
+    Next
+  Next
+EndProcedure
+
+Procedure StartWave()
+  Protected r, c, now = ElapsedMilliseconds()
+  For r = 0 To #ROWS - 1
+    For c = 0 To #COLS - 1
+      If r = 1 : hp(r, c) = 2 : Else : hp(r, c) = 1 : EndIf
+    Next
+  Next
+  alive = #ROWS * #COLS
+  ax = (#SW - #COLS * #CELL_W) / 2 : ay = #AY_START + (wave - 1) * 10 : dir = 1
+  For r = 0 To #MAX_SHOTS - 1 : shot(r)\act = 0 : Next
+  For r = 0 To 15 : bomb(r)\act = 0 : Next
+  For r = 0 To 1 : spOn(r) = #False : SetNext(r) : Next
+  bState = 0 : duckOn = #False : rbOn = #False
+  nextStep = now + 600 : nextBomb = now + 1500
+EndProcedure
+
+Procedure NewGame()
+  score = 0 : lives = #LIVES : wave = 1 : state = #St_Play
+  px = (#SW - #CELL_W) / 2
+  hitUntil = 0 : invUntil = 0 : boostUntil = 0
+  StartWave()
+  Say("WAVE 1 - FIXED BY AI")
+EndProcedure
+
+Procedure EndGame(newState)
+  state = newState
+  If score > hiscore : hiscore = score : EndIf
+  lock = ElapsedMilliseconds() + 900 : overAt = ElapsedMilliseconds()
+EndProcedure
+
+; ---------- armada ----------
+Procedure StepDelay()
+  Protected d = (#STEP_BASE + alive * #STEP_PER_ENEMY) * (100 - (wave - 1) * #WAVE_SPEEDUP) / 100
+  If ElapsedMilliseconds() < boostUntil : d = d / 2 : EndIf
+  If d < #STEP_MIN : d = #STEP_MIN : EndIf
+  ProcedureReturn d
+EndProcedure
+
+Procedure StepArmada()
+  Scan()
+  If (dir > 0 And ax + (gMaxC + 1) * #CELL_W + #STEP_PIXELS >= #SW) Or (dir < 0 And ax + gMinC * #CELL_W - #STEP_PIXELS <= 0)
+    dir = -dir
+    ay = ay + #DROP
+  Else
+    ax = ax + dir * #STEP_PIXELS
+  EndIf
+  frame = 1 - frame
+EndProcedure
+
+Procedure DropBomb()
+  Protected c, r, i, k, n = 1 + (wave - 1) / #BURST_EVERY
+  For k = 1 To n
+    c = Random(#COLS - 1)
+    If Random(99) < #AIM_PERCENT
+      c = (px + 32 - ax) / #CELL_W
+      If c < 0 : c = 0 : ElseIf c > #COLS - 1 : c = #COLS - 1 : EndIf
+    EndIf
+    For r = #ROWS - 1 To 0 Step -1
+      If hp(r, c) : Break : EndIf
+    Next
+    If r >= 0
+      For i = 0 To 15
+        If bomb(i)\act = 0
+          bomb(i)\x = ax + c * #CELL_W + #CELL_W / 2 - 3
+          bomb(i)\y = ay + r * #ROW_H + 40
+          bomb(i)\act = 1 + Bool(r = 2 And Random(#HALLU_CHANCE - 1) = 0)
+          Break
+        EndIf
+      Next
+    EndIf
+  Next
+EndProcedure
+
+Procedure KillEnemy(r, c)
+  Protected k = Random(#COLS - 1)
+  hp(r, c) = hp(r, c) - 1
+  If hp(r, c) > 0 : score = score + 5 : ProcedureReturn : EndIf
+  alive = alive - 1
+  AddBoom(ax + c * #CELL_W, ay + r * #ROW_H, r)
+  Sfx(#Snd_Explosion)
+  Select r
+    Case 0 : score = score + #PTS_BUG
+      If Random(#BUG_REBORN - 1) = 0 And rbOn = 0 And hp(0, k) = 0 And k <> c       ; fixed by AI: a new Bug comes back
+        rbOn = #True : rbCol = k : rbStart = ElapsedMilliseconds() : rbSX = Random(#SW - 64) : rbSY = #SH
+        rbBend = 120 - Random(1) * 240 : alive = alive + 1 : Say("FIXED BY AI (+1 NEW BUG)")
+      EndIf
+    Case 1 : score = score + #PTS_KNOT : Say("CODE KNOT REFACTORED")
+    Case 2 : score = score + #PTS_COMMIT : boostUntil = ElapsedMilliseconds() + #MERGE_BOOST : Say("MERGE CONFLICT!")
+  EndSelect
+EndProcedure
+
+; ---------- special enemies: CEO Cash $$$ (k = 0) and MegaCenter (k = 1) ----------
+Procedure HitSpecial(k)
+  Protected now = ElapsedMilliseconds()
+  spHp(k) = spHp(k) - 1 : spHit(k) = now + 300 : score = score + 25
+  If spHp(k) > 0
+    If k = #SP_CASH
+      Say("BUDGET CUT " + Str(#CASH_HITS - spHp(k)) + "/" + Str(#CASH_HITS), 900)
+    Else
+      Say("SERVER OVERHEAT " + Str(#MEGA_HITS - spHp(k)) + "/" + Str(#MEGA_HITS), 900)
+    EndIf
+    ProcedureReturn
+  EndIf
+  spOn(k) = #False : SetNext(k)
+  AddBoom(spX(k), spY(k), 3 + k) : Sfx(#Snd_Explosion)
+  If k = #SP_CASH
+    score = score + #PTS_CASH
+    ay = ay - #DROP                                   ; SPECIAL RULE: the armada goes up one line!
+    If ay < #AY_MIN : ay = #AY_MIN : EndIf
+    Say("BUDGET APPROVED! ARMADA -1 LINE", 2200)
+    duckOn = #True : duckX = spX(k) : duckY = spY(k)
+  Else
+    score = score + #PTS_MEGA
+    If bState = 1 : bState = 0 : EndIf
+    Say("DATA CENTER DOWN!", 1800)
+  EndIf
+EndProcedure
+
+Procedure HurtPlayer()
+  Protected now = ElapsedMilliseconds()
+  lives = lives - 1
+  hitUntil = now + 600 : invUntil = now + 1800
+  Sfx(#Snd_Explosion)
+  If lives <= 0 : EndGame(#St_Over) : Else : Say(StringField(quotes$, Random(7) + 1, "|")) : EndIf
+EndProcedure
+
+Procedure Fire()
+  Protected i
+  For i = 0 To #MAX_SHOTS - 1
+    If shot(i)\act = 0
+      shot(i)\x = px + 45 : shot(i)\y = #PLAYER_Y + 10 : shot(i)\act = 1
+      fireUntil = ElapsedMilliseconds() + 90
+      Sfx(#Snd_Shoot)
+      Break
+    EndIf
+  Next
+EndProcedure
+
+; ---------- game logic (one tick) ----------
+Procedure Update()
+  Protected i, k, r, c, x, y, sp.f, tf.f, now = ElapsedMilliseconds()
+
+  moving = #False
+  If KeyboardPushed(#PB_Key_Left)  : px = px - #PLAYER_SPEED : moving = #True : EndIf
+  If KeyboardPushed(#PB_Key_Right) : px = px + #PLAYER_SPEED : moving = #True : EndIf
+  If px < 0 : px = 0 : EndIf
+  If px > #SW - #CELL_W : px = #SW - #CELL_W : EndIf
+  If KeyboardPushed(#PB_Key_Space) And now >= nextShot : Fire() : nextShot = now + #FIRE_DELAY : EndIf
+
+  If now >= nextStep : StepArmada() : nextStep = now + StepDelay() : EndIf
+  If now >= nextBomb : DropBomb() : nextBomb = now + Random(#BOMB_DELAY_MAX - (wave - 1) * #BOMB_WAVE_FASTER, #BOMB_DELAY_MIN) : EndIf
+
+  ; specials: CEO Cash on the top lane, MegaCenter on the line just below the armada
+  Scan()
+  spY(#SP_CASH) = #CASH_Y : spY(#SP_MEGA) = ay + (gMaxR + 1) * #ROW_H
+  For k = 0 To 1
+    If spOn(k)
+      If k = #SP_CASH : sp = #CASH_SPEED : Else : sp = #MEGA_SPEED : EndIf
+      spX(k) = spX(k) - sp
+      If spX(k) < -64
+        spOn(k) = #False : SetNext(k)
+        If k = #SP_MEGA : ay = ay + #DROP : Say("SERVER OVERLOAD! ARMADA +1 LINE", 2200) : EndIf
+      EndIf
+    ElseIf now >= spNext(k)
+      spOn(k) = #True : spX(k) = #SW
+      If k = #SP_CASH : spHp(k) = #CASH_HITS : Else : spHp(k) = #MEGA_HITS : EndIf
+    EndIf
+  Next
+
+  ; MegaCenter lightning: warning, then strike on the column locked at warning time
+  If bState = 0 And spOn(#SP_MEGA) And now >= bCool And Abs(spX(#SP_MEGA) - px) < 20
+    bState = 1 : bX = spX(#SP_MEGA) + 32 : bUntil = now + #BOLT_WARN : bHit = #False
+  ElseIf bState = 1 And now >= bUntil
+    bState = 2 : bUntil = now + #BOLT_STRIKE : Sfx(#Snd_Explosion)
+  ElseIf bState = 2
+    If bHit = 0 And now > invUntil And now >= shieldUntil And Abs(bX - (px + 32)) < 22 : bHit = #True : HurtPlayer() : EndIf
+    If now >= bUntil : bState = 0 : bCool = now + #BOLT_COOLDOWN : EndIf
+  EndIf
+
+  ; the new Bug flies back from the bottom of the screen to its place in the armada (curve)
+  If rbOn
+    tf = (now - rbStart) / (#REBORN_MS * 1.0)
+    rbX = rbSX + (ax + rbCol * #CELL_W - rbSX) * tf + Sin(tf * 3.14159) * rbBend
+    rbY = rbSY + (ay - rbSY) * tf
+    If tf >= 1 : rbOn = #False : hp(0, rbCol) = 1 : EndIf
+  EndIf
+
+  ; Fred bullets
+  For i = 0 To #MAX_SHOTS - 1
+    If shot(i)\act
+      shot(i)\y = shot(i)\y - 9
+      If shot(i)\y < -20 : shot(i)\act = 0 : EndIf
+      For k = 0 To 1
+        If shot(i)\act And spOn(k) And Hit(shot(i)\x, shot(i)\y, 4, 14, spX(k) + 1, spY(k) + 8, 62, 30)
+          shot(i)\act = 0 : HitSpecial(k)
+        EndIf
+      Next
+      If shot(i)\act And rbOn And Hit(shot(i)\x, shot(i)\y, 4, 14, rbX + 12, rbY + 6, 40, 36)
+        shot(i)\act = 0 : rbOn = #False : alive = alive - 1 : score = score + #PTS_BUG
+        AddBoom(rbX, rbY, 0) : Sfx(#Snd_Explosion) : Say("BUG SQUASHED... AGAIN")
+      EndIf
+      For r = 0 To #ROWS - 1
+        For c = 0 To #COLS - 1
+          If shot(i)\act And hp(r, c)
+            x = ax + c * #CELL_W + 12 : y = ay + r * #ROW_H + 6
+            If Hit(shot(i)\x, shot(i)\y, 4, 14, x, y, 40, 36) : shot(i)\act = 0 : KillEnemy(r, c) : EndIf
+          EndIf
+        Next
+      Next
+    EndIf
+  Next
+
+  ; enemy bombs
+  For i = 0 To 15
+    If bomb(i)\act
+      bomb(i)\y = bomb(i)\y + #BOMB_SPEED + wave / 3
+      If bomb(i)\y > #SH
+        bomb(i)\act = 0
+      ElseIf Hit(bomb(i)\x, bomb(i)\y, 6, 14, px + 14, #PLAYER_Y + 10, 36, 58)
+        If now < shieldUntil
+          bomb(i)\act = 0
+        ElseIf now > invUntil
+          If bomb(i)\act = 1 : bomb(i)\act = 0 : HurtPlayer() : ElseIf bomb(i)\act = 2 : bomb(i)\act = 3 : Say("HALLUCINATION! (NO DAMAGE)", 1200) : EndIf
+        EndIf
+      EndIf
+    EndIf
+  Next
+
+  ; rubber duck falls from the dead CEO: catch it for a shield
+  If duckOn
+    duckY = duckY + 3
+    If duckY > #SH
+      duckOn = #False
+    ElseIf Hit(duckX + 14, duckY + 10, 36, 28, px + 14, #PLAYER_Y + 10, 36, 58)
+      duckOn = #False : shieldUntil = now + #SHIELD_MS : score = score + 50 : Say("RUBBER DUCK! SHIELD ON", 1800)
+    EndIf
+  EndIf
+
+  ; wave cleared / system crash
+  Scan()
+  If state = #St_Play
+    If alive = 0
+      wave = wave + 1
+      If wave > #MAX_WAVE : EndGame(#St_Win) : Else : StartWave() : Say("LGTM! WAVE " + Str(wave) + "/" + Str(#MAX_WAVE), 2000) : EndIf
+    ElseIf ay + (gMaxR + 1) * #ROW_H >= #LOSE_Y
+      EndGame(#St_Over)
+    EndIf
+  EndIf
+EndProcedure
+
+; ---------- rendering ----------
+Procedure CenterText(y, text$, color)
+  DrawText((#SW - TextWidth(text$)) / 2, y, text$, color)
+EndProcedure
+
+Procedure TitleRow(i, name$, info$, desc$)
+  Protected y = 112 + i * 64
+  DrawText(110, y + 6, name$, RGB(60, 255, 160))
+  DrawText(300, y + 6, info$, RGB(255, 210, 40))
+  DrawText(110, y + 30, desc$, RGB(150, 170, 255))
+EndProcedure
+
+; one chat bubble (who: 0 = AI, 1 = Fred), returns the y of the next bubble
+Procedure Bubble(who, text$, y)
+  Protected i, n = CountString(text$, "|") + 1, w, t, h, x, col, lc, tc, lab$
+  For i = 1 To n
+    t = TextWidth(StringField(text$, i, "|"))
+    If t > w : w = t : EndIf
+  Next
+  w = w + 20 : h = n * 18 + 10
+  If who = 0
+    x = 172 : col = RGB(244, 244, 250) : lc = RGB(190, 140, 255) : tc = RGB(25, 25, 45) : lab$ = "AI"
+  Else
+    x = 668 - w : col = RGB(18, 80, 70) : lc = RGB(60, 255, 160) : tc = RGB(255, 255, 255) : lab$ = "FRED"
+  EndIf
+  DrawingMode(#PB_2DDrawing_Default)
+  RoundBox(x, y + 16, w, h, 8, 8, col)
+  DrawingMode(#PB_2DDrawing_Transparent)
+  DrawText(x, y, lab$, lc)
+  For i = 1 To n : DrawText(x + 10, y + 21 + (i - 1) * 18, StringField(text$, i, "|"), tc) : Next
+  ProcedureReturn y + 16 + h + 8
+EndProcedure
+
+; Game Over chat, inspired by the LGTM video: one new message every 1.5 s
+Procedure DrawChat(now)
+  Protected n, y = 226, t = now - overAt - 700, m$, i, h$ = "Hello, Fred. How can I help you today?"
+  DrawingFont(FontID(2))
+  DrawingMode(#PB_2DDrawing_Default)
+  RoundBox(160, 192, 520, 256, 10, 10, RGB(8, 10, 34))
+  DrawingMode(#PB_2DDrawing_Outlined)
+  RoundBox(160, 192, 520, 256, 10, 10, RGB(60, 120, 255))
+  DrawingMode(#PB_2DDrawing_Transparent)
+  DrawText(160 + (520 - TextWidth(h$)) / 2, 198, h$, RGB(120, 150, 255))
+  If t >= 0 : n = t / 1500 + 1 : EndIf
+  If n > 3 : n = 3 : EndIf
+  If state = #St_Over
+    m$ = "Sorry Fred, you lost ;)|I'm going to restore from the backup|right before you lost it."
+    m$ = m$ + "#We don't have a backup.#You're right. I'm sorry for the confusion.|I'll restore from backup :)"
+  Else
+    m$ = "I reviewed all 4,200 lines in 0.2 seconds.|LGTM! Ship it."
+    m$ = m$ + "#Did you actually read them?#You're absolutely right to ask!|It compiles. It passes. Nobody knows why."
+  EndIf
+  For i = 1 To n : y = Bubble(Bool(i = 2), StringField(m$, i, "#"), y) : Next
+  If n < 3                                         ; typing indicator
+    If n = 1 : DrawText(638, y + 4, Left("...", 1 + ((now / 250) & 1) * 2), RGB(60, 255, 160))
+    Else : DrawText(182, y + 4, Left("...", 1 + ((now / 250) & 1) * 2), RGB(190, 140, 255)) : EndIf
+  EndIf
+  DrawingFont(FontID(0))
+EndProcedure
+
+; fake compilation shown at start
+Procedure DrawBoot(now)
+  Protected t = now - bootAt, p, g = RGB(60, 255, 160)
+  p = (t - 500) / 10
+  If p < 0 : p = 0 : EndIf
+  If p > 100 : p = 100 : EndIf
+  StartDrawing(ScreenOutput())
+  Box(0, 0, #SW, #SH, RGB(4, 6, 18))
+  DrawingMode(#PB_2DDrawing_Transparent)
+  DrawingFont(FontID(0))
+  DrawText(40, 40, "> pbcompiler IA_Invaders.pb", g)
+  If t > 400 : DrawText(40, 80, "Compiling... " + RSet(Str(p), 3) + "% [" + Left("##########", p / 10) + Left("..........", 10 - p / 10) + "]", g) : EndIf
+  If t > 1600 : DrawText(40, 120, "0 errors, 0 warnings, 0 tests.", RGB(150, 170, 255)) : EndIf
+  If t > 2200 : DrawText(40, 160, "Looks Good to Me!", RGB(255, 210, 40)) : EndIf
+  If t > 2600 : DrawText(40, 220, "(Nobody Knows Why!!!)", RGB(80, 114, 255)) : EndIf
+  If t > 3000 : DrawText(40, 260, "_", g) : EndIf
+  StopDrawing()
+EndProcedure
+
+Procedure Draw()
+  Protected r, c, i, j, k, f, a, by, y, x0, x1, mx, vis, now = ElapsedMilliseconds()
+  If state = #St_Boot : DrawBoot(now) : ProcedureReturn : EndIf
+  DisplaySprite(#Spr_BG, 0, 0)
+
+  If state = #St_Title
+    StartDrawing(ScreenOutput())
+    DrawingMode(#PB_2DDrawing_AlphaBlend)
+    Box(20, 64, 760, 506, RGBA(4, 6, 28, 205))
+    Line(20, 64, 760, 0, RGBA(60, 120, 255, 255)) : Line(20, 570, 760, 0, RGBA(60, 120, 255, 255))
+    Line(20, 64, 0, 506, RGBA(60, 120, 255, 255)) : Line(780, 64, 0, 506, RGBA(60, 120, 255, 255))
+    For i = 1 To 4 : Line(30, 110 + i * 64, 740, 0, RGBA(60, 100, 200, 110)) : Next
+    StopDrawing()
+    For i = 0 To 4
+      ClipSprite(#Spr_Enemies, i * 64, ((now / 400) & 1) * 48, 64, 48)
+      DisplayTransparentSprite(#Spr_Enemies, 34, 120 + i * 64)
+    Next
+  ElseIf state = #St_Over Or state = #St_Win
+    ClipSprite(#Spr_Player, Bool(state = #St_Over) * 192, 0, 64, 72)
+    DisplayTransparentSprite(#Spr_Player, 48, 284)
+  ElseIf state = #St_Play
+    For r = 0 To #ROWS - 1
+      For c = 0 To #COLS - 1
+        If hp(r, c)
+          If hp(r, c) = 1 And r = 1 : a = 150 : Else : a = 255 : EndIf
+          ClipSprite(#Spr_Enemies, r * 64, frame * 48, 64, 48)
+          DisplayTransparentSprite(#Spr_Enemies, ax + c * #CELL_W, ay + r * #ROW_H, a)
+        EndIf
+      Next
+    Next
+    For k = 0 To 1
+      If spOn(k)
+        vis = Bool(now >= spHit(k) Or ((now / 50) & 1) = 0)
+        If vis
+          ClipSprite(#Spr_Enemies, (3 + k) * 64, ((now / 150) & 1) * 48, 64, 48)
+          DisplayTransparentSprite(#Spr_Enemies, spX(k), spY(k))
+        EndIf
+      EndIf
+    Next
+    For i = 0 To 31
+      If boom(i)\t > now
+        ClipSprite(#Spr_Enemies, boom(i)\kind * 64, 96, 64, 48)
+        DisplayTransparentSprite(#Spr_Enemies, boom(i)\x, boom(i)\y)
+      EndIf
+    Next
+    If duckOn : ClipSprite(#Spr_Enemies, 320, 0, 64, 48) : DisplayTransparentSprite(#Spr_Enemies, duckX, duckY) : EndIf
+    If rbOn : ClipSprite(#Spr_Enemies, 0, ((now / 100) & 1) * 48, 64, 48) : DisplayTransparentSprite(#Spr_Enemies, rbX, rbY) : EndIf
+    If state = #St_Play
+      f = 0 : by = #PLAYER_Y
+      If moving And ((now / 90) & 1) = 1 : by = by + 3 : EndIf
+      If now < hitUntil : f = 2 : ElseIf now < fireUntil : f = 1 : EndIf
+      If now >= invUntil Or ((now / 90) & 1) = 0
+        ClipSprite(#Spr_Player, f * 64, 0, 64, 72)
+        DisplayTransparentSprite(#Spr_Player, px, by)
+      EndIf
+    EndIf
+  EndIf
+
+  StartDrawing(ScreenOutput())
+  If state = #St_Play
+    For i = 0 To #MAX_SHOTS - 1 : If shot(i)\act : Box(shot(i)\x, shot(i)\y, 4, 14, RGB(120, 255, 90)) : EndIf : Next
+    For i = 0 To 15
+      If bomb(i)\act : a = RGB(255, 80, 80) : If bomb(i)\act > 1 : a = RGB(120, 255, 255) : EndIf : Box(bomb(i)\x, bomb(i)\y, 6, 14, a) : EndIf
+    Next
+    If now < shieldUntil And (shieldUntil - now > 1200 Or ((now / 100) & 1) = 1)
+      DrawingMode(#PB_2DDrawing_Outlined) : Circle(px + 32, #PLAYER_Y + 40, 44, RGB(120, 200, 255)) : Circle(px + 32, #PLAYER_Y + 40, 45, RGB(200, 235, 255))
+      DrawingMode(#PB_2DDrawing_Default)
+    EndIf
+    For k = 0 To 1
+      If spOn(k)
+        If k = #SP_CASH : mx = #CASH_HITS : Else : mx = #MEGA_HITS : EndIf
+        For j = 1 To mx                                ; hit points
+          If j <= spHp(k) : a = RGB(255, 80, 80) : Else : a = RGB(50, 50, 80) : EndIf
+          Box(spX(k) + 32 - mx * 8 + (j - 1) * 16, spY(k) + 44, 12, 5, a)
+        Next
+        If now < spHit(k)                              ; impact sparks
+          For j = 1 To 8 : Box(spX(k) + Random(60), spY(k) + 8 + Random(30), 4, 4, RGB(255, 240, 120)) : Next
+        EndIf
+      EndIf
+    Next
+    If bState = 1
+      For y = spY(#SP_MEGA) + 44 To #SH Step 20 : Line(bX, y, 0, 8, RGB(120, 180, 255)) : Next
+    ElseIf bState = 2
+      x0 = bX
+      For y = spY(#SP_MEGA) + 44 To #SH Step 22
+        x1 = bX + Random(28) - 14
+        Line(x0, y, x1 - x0, 22, RGB(130, 210, 255)) : Line(x0 + 1, y, x1 - x0, 22, RGB(255, 255, 255))
+        x0 = x1
+      Next
+    EndIf
+  EndIf
+  DrawingMode(#PB_2DDrawing_Transparent)
+  DrawingFont(FontID(0))
+  If state <> #St_Title
+    DrawText(16, 8, "SCORE " + RSet(Str(score), 7, "0"), RGB(60, 255, 160))
+    DrawText(330, 8, "LEVEL " + Str(wave), RGB(150, 170, 255))
+    DrawText(560, 8, "HI-SCORE " + RSet(Str(hiscore), 7, "0"), RGB(255, 210, 40))
+    DrawText(16, #SH - 28, "FRED x " + Str(lives), RGB(255, 255, 255))
+    DrawText(#SW - 200, #SH - 28, "WAVE " + Str(wave) + "/" + Str(#MAX_WAVE), RGB(60, 255, 160))
+    If now < msgUntil : CenterText(#SH - 28, msg$, RGB(255, 235, 90)) : EndIf
+  EndIf
+  DrawingFont(FontID(1))
+  Select state
+    Case #St_Title : CenterText(14, "IA Invaders", RGB(60, 255, 160))
+    Case #St_Over : CenterText(76, "Game Over dear Developper!", RGB(255, 80, 80))
+    Case #St_Win : CenterText(76, "LGTM!  Shipped to Prod", RGB(60, 255, 160))
+  EndSelect
+  DrawingFont(FontID(0))
+  Select state
+    Case #St_Title
+      CenterText(70, "Looks Good to Me. It compiles. It passes. Nobody knows why!", RGB(150, 170, 255))
+      TitleRow(0, "BUG", Str(#PTS_BUG) + " pts - 1 hit", "Bug. Squash it. It can reappear due to a fake AI fix")
+      TitleRow(1, "CODE KNOT", Str(#PTS_KNOT) + " pts - 2 hits", "Spaghetti code: needs a refactor.")
+      TitleRow(2, "GIT COMMIT", Str(#PTS_COMMIT) + " pts - 1 hit", "Merge conflict: armada speeds up! Cyan shots: fake.")
+      TitleRow(3, "CEO CASH $$$", Str(#PTS_CASH) + " pts - " + Str(#CASH_HITS) + " hits", "Kill it: armada UP 1 line! Catch the duck for a 6s shield")
+      TitleRow(4, "MEGACENTER", Str(#PTS_MEGA) + " pts - " + Str(#MEGA_HITS) + " hits", "Lightning! Escape: armada DOWN 1 line!")
+      CenterText(436, "ARROWS = move    SPACE = fire    ESC = quit", RGB(255, 255, 255))
+      CenterText(484, "Kill the CEO, catch the RUBBER DUCK = shield!", RGB(255, 210, 40))
+      CenterText(540, "HI-SCORE " + RSet(Str(hiscore), 7, "0"), RGB(255, 210, 40))
+    Case #St_Over, #St_Win
+      CenterText(150, "FINAL SCORE " + RSet(Str(score), 7, "0"), RGB(255, 255, 255))
+      DrawChat(now)
+  EndSelect
+  If state <> #St_Play And ((now / 500) & 1) = 1
+    by = 516 : If state = #St_Over Or state = #St_Win : by = 512 : EndIf
+    CenterText(by, "PRESS SPACE", RGB(60, 255, 160))
+  EndIf
+  StopDrawing()
+EndProcedure
+
+; ---------- main ----------
+Define ev, quit, t0, wt$ = "IA Invaders - PurePunch Halloween 2026"
+
+
+UsePNGImageDecoder()
+UseOGGSoundDecoder()
+If InitSprite() = 0 Or InitKeyboard() = 0
+  MessageRequester("IA Invaders", "Cannot initialize the screen.")
+  End
+EndIf
+
+; DPI aware: the window inner size must be exactly #SW x #SH real pixels
+OpenWindow(0, 0, 0, DesktopUnscaledX(#SW), DesktopUnscaledY(#SH), wt$, #PB_Window_SystemMenu | #PB_Window_ScreenCentered)
+Need(OpenWindowedScreen(WindowID(0), 0, 0, #SW, #SH, #False, 0, 0), "screen")
+
+Need(CatchSprite(#Spr_BG, ?background), "background.png")
+Need(CatchSprite(#Spr_Enemies, ?enemies_sheet, #PB_Sprite_AlphaBlending), "enemies_sheet.png")
+Need(CatchSprite(#Spr_Player, ?player, #PB_Sprite_AlphaBlending), "player.png")
+LoadFont(0, "Courier New", DesktopUnscaledX(14), #PB_Font_Bold)
+LoadFont(1, "Courier New", DesktopUnscaledX(36), #PB_Font_Bold)
+LoadFont(2, "Comic Sans MS", DesktopUnscaledX(11))
+
+hasSound = InitSound()
+If hasSound
+  CatchSound(#Snd_Shoot, ?snd_shoot, ?Endsnd_shoot - ?snd_shoot) : SoundVolume(#Snd_Shoot, 35)
+  CatchSound(#Snd_Explosion, ?snd_explosion, ?Endsnd_explosion - ?snd_explosion) : SoundVolume(#Snd_Explosion, 25)
+  If CatchSound(#Snd_Music, ?music_theme, ?Endmusic_theme - ?music_theme)
+    SoundVolume(#Snd_Music, 50)
+    PlaySound(#Snd_Music, #PB_Sound_Loop)
+  EndIf
+EndIf
+
+quotes$ = "REGRESSION DETECTED!|WORKS ON MY MACHINE|IT WAS WORKING YESTERDAY|TRY TURNING IT OFF AND ON AGAIN"
+quotes$ = quotes$ + "|NOT A BUG, IT'S A FEATURE|SEGFAULT (CORE DUMPED)|STACK OVERFLOW... AGAIN|YOU'RE ABSOLUTELY RIGHT!"
+state = #St_Boot : bootAt = ElapsedMilliseconds()
+Repeat
+  t0 = ElapsedMilliseconds()
+  Repeat
+    ev = WindowEvent()
+    If ev = #PB_Event_CloseWindow : quit = #True : EndIf
+  Until ev = 0
+  ExamineKeyboard()
+  If KeyboardPushed(#PB_Key_Escape) : quit = #True : EndIf
+  If state = #St_Play
+    Update()
+  ElseIf state = #St_Boot
+    If ElapsedMilliseconds() - bootAt > 3400 Or KeyboardPushed(#PB_Key_Space) : state = #St_Title : lock = ElapsedMilliseconds() + 300 : EndIf
+  ElseIf KeyboardPushed(#PB_Key_Space) And ElapsedMilliseconds() > lock
+    NewGame()
+  EndIf
+  Draw()
+  FlipBuffers()
+  While ElapsedMilliseconds() - t0 < 16 : Delay(1) : Wend
+Until quit
+
+; resources embedded in the executable (the files must be next to this source when compiling)
+DataSection
+  background:    : IncludeBinary "background.png"    : Endbackground:
+  enemies_sheet: : IncludeBinary "enemies_sheet.png" : Endenemies_sheet:
+  player:        : IncludeBinary "player.png"        : Endplayer:
+  snd_shoot:     : IncludeBinary "snd_shoot.wav"     : Endsnd_shoot:
+  snd_explosion: : IncludeBinary "snd_explosion.wav" : Endsnd_explosion:
+  music_theme:   : IncludeBinary "music_theme.ogg"   : Endmusic_theme:
+EndDataSection
+
+; IDE Options = PureBasic 6.41 (Windows - x64)
+; CursorPosition = 21
+; Folding = -----
+; Optimizer
+; EnableXP
+; DPIAware
+; UseIcon = IA_Invaders_icon.ico
+; Executable = IA_Invaders.exe
+; Compiler = PureBasic 6.41 - C Backend (Windows - x64)
+; IncludeVersionInfo
+; VersionField0 = 1.0.0.0
+; VersionField1 = 1.0.0.0
+; VersionField2 = ChrisR
+; VersionField3 = IA Invaders
+; VersionField5 = 1.0
+; VersionField6 = IA Invaders
