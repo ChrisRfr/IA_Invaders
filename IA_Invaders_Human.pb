@@ -4,6 +4,17 @@
 ; Pure PureBasic: no API, no external library.;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ; Keys: LEFT / RIGHT = move, SPACE = fire, ESC = quit.;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ; ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+; --------------------------------------------------------------------------------------------------------------------------------------
+; HOW IT WORKS:
+; - A Space Invaders clone: Fred (bottom of the screen) shoots the armada of Bugs, Code Knots and Git Commits, which goes down line by line.
+; - Two special enemies: CEO Cash $$$ (top: 3 hits, the armada goes up) and MegaCenter (under the armada: lightning, escapes = armada goes down).
+; - Fixed time step: Update() (the game logic) runs 60 times per second whatever the screen refresh rate, then Draw() shows the result.
+; - No drawing command while playing: texts and shapes are drawn once into sprites (cached), then only sprites are displayed.
+; - Resources (images, sounds, music) are embedded in the exe with DataSection and IncludeBinary.
+; - States: Boot (fake compilation) > Title > Play > Game Over or Victory. All the tuning constants are at the top of this file.
+; --------------------------------------------------------------------------------------------------------------------------------------
+
 EnableExplicit
 
 ; ---------- TUNING: change these values to adjust the game ----------
@@ -11,6 +22,7 @@ EnableExplicit
 #MAX_WAVE = 5              ; number of waves to survive
 #PLAYER_SPEED = 5          ; Fred speed (pixels per frame)
 #FIRE_DELAY = 320          ; ms between two Fred shots (bigger = harder)
+#TICK_MS = 16.6667          ; game logic step in ms (60 steps per second)
 #MAX_SHOTS = 3             ; Fred bullets on screen at the same time (smaller = harder)
 #STEP_PIXELS = 8           ; armada horizontal move per step
 #STEP_BASE = 36            ; armada step delay in ms (smaller = faster)
@@ -56,6 +68,13 @@ EnableExplicit
 #LOSE_Y = 470              ; armada reaching this line = system crash (painted in background.png)
 #PLAYER_Y = #SH - 76
 #SP_CASH = 0 : #SP_MEGA = 1
+#Img_Measure = 0           ; 1x1 image used to measure text
+#Spr_Solid = 10            ; 8 solid colour sprites (10 to 17), zoomed to draw rectangles
+#Spr_Title = 20            ; pre-rendered title panel
+#Spr_Chat = 21             ; pre-rendered chat panel
+#Spr_Ring = 22             ; pre-rendered shield ring
+#Spr_Cache = 100           ; first sprite number of the text cache
+#CACHE_MAX = 250           ; the text cache is flushed beyond this number of entries
 
 Enumeration
   #Spr_BG
@@ -100,6 +119,7 @@ Global Dim spY(1)
 Global Dim spHp(1)
 Global Dim spHit(1)
 Global Dim spNext(1)
+Global NewMap tc()
 
 Global state, score, hiscore, lives, wave, ax, ay, dir, frame, alive
 Global nextStep, nextBomb, nextShot, boostUntil, hitUntil, invUntil
@@ -107,25 +127,31 @@ Global msgUntil, fireUntil, lock, hasSound, gMinC, gMaxC, gMaxR, moving
 Global bState, bUntil, bCool, bHit, overAt, bootAt, duckOn, shieldUntil, rbOn, rbCol, rbStart, rbSX, rbSY, rbBend
 Global px.f, bX.f, duckX.f, duckY.f, rbX.f, rbY.f
 Global msg$, quotes$
+Global nextSpr, cGreen, cBlue, cYellow, cWhite, cMsg, cDBlue, cRed, cLilac, cHead
 
+; collision test: 1 if rectangle 1 overlaps rectangle 2
 Macro Hit(x1, y1, w1, h1, x2, y2, w2, h2)
   Bool((x1) < (x2) + (w2) And (x1) + (w1) > (x2) And (y1) < (y2) + (h2) And (y1) + (h1) > (y2))
 EndMacro
 
 ; ---------- helpers ----------
+; stops the program with a message when a resource can not be loaded
 Procedure Need(ok, file$)
   If ok = 0 : MessageRequester("IA Invaders", "Missing resource: " + file$) : End : EndIf
 EndProcedure
 
+; plays a sound effect (if the sound system is available)
 Procedure Sfx(n)
   If hasSound : PlaySound(n, #PB_Sound_MultiChannel) : EndIf
 EndProcedure
 
+; shows a message at the bottom of the screen for ms milliseconds
 Procedure Say(text$, ms = 1600)
   msg$ = text$
   msgUntil = ElapsedMilliseconds() + ms
 EndProcedure
 
+; starts an explosion animation at x, y (kind = row of the sprite sheet)
 Procedure AddBoom(x, y, kind)
   Protected i, now = ElapsedMilliseconds()
   For i = 0 To 31
@@ -136,6 +162,7 @@ Procedure AddBoom(x, y, kind)
   Next
 EndProcedure
 
+; schedules the next appearance of a special enemy (0 = CEO Cash, 1 = MegaCenter)
 Procedure SetNext(k)
   If k = #SP_CASH
     spNext(k) = ElapsedMilliseconds() + Random(#CASH_DELAY_MAX, #CASH_DELAY_MIN)
@@ -159,6 +186,7 @@ Procedure Scan()
   Next
 EndProcedure
 
+; builds a new armada and resets bullets, bombs and special enemies
 Procedure StartWave()
   Protected r, c, now = ElapsedMilliseconds()
   For r = 0 To #ROWS - 1
@@ -175,6 +203,7 @@ Procedure StartWave()
   nextStep = now + 600 : nextBomb = now + 1500
 EndProcedure
 
+; starts a new game: score, lives and the first wave
 Procedure NewGame()
   score = 0 : lives = #LIVES : wave = 1 : state = #St_Play
   px = (#SW - #CELL_W) / 2
@@ -183,6 +212,7 @@ Procedure NewGame()
   Say("WAVE 1 - FIXED BY AI")
 EndProcedure
 
+; switches to the Game Over or Victory screen and updates the hi-score
 Procedure EndGame(newState)
   state = newState
   If score > hiscore : hiscore = score : EndIf
@@ -190,6 +220,7 @@ Procedure EndGame(newState)
 EndProcedure
 
 ; ---------- armada ----------
+; delay in ms between two armada steps (shorter when the armada is small, and at higher waves)
 Procedure StepDelay()
   Protected d = (#STEP_BASE + alive * #STEP_PER_ENEMY) * (100 - (wave - 1) * #WAVE_SPEEDUP) / 100
   If ElapsedMilliseconds() < boostUntil : d = d / 2 : EndIf
@@ -197,6 +228,7 @@ Procedure StepDelay()
   ProcedureReturn d
 EndProcedure
 
+; moves the armada by one step: sideways, or down one line at the edges
 Procedure StepArmada()
   Scan()
   If (dir > 0 And ax + (gMaxC + 1) * #CELL_W + #STEP_PIXELS >= #SW) Or (dir < 0 And ax + gMinC * #CELL_W - #STEP_PIXELS <= 0)
@@ -208,6 +240,7 @@ Procedure StepArmada()
   frame = 1 - frame
 EndProcedure
 
+; makes one or more enemies drop a bomb (some aimed at Fred, some fake: hallucinations)
 Procedure DropBomb()
   Protected c, r, i, k, n = 1 + (wave - 1) / #BURST_EVERY
   For k = 1 To n
@@ -232,6 +265,7 @@ Procedure DropBomb()
   Next
 EndProcedure
 
+; a Fred bullet hit the enemy (r, c): damage, points and special effects
 Procedure KillEnemy(r, c)
   Protected k = Random(#COLS - 1)
   hp(r, c) = hp(r, c) - 1
@@ -251,6 +285,7 @@ Procedure KillEnemy(r, c)
 EndProcedure
 
 ; ---------- special enemies: CEO Cash $$$ (k = 0) and MegaCenter (k = 1) ----------
+; a Fred bullet hit CEO Cash (k = 0) or MegaCenter (k = 1)
 Procedure HitSpecial(k)
   Protected now = ElapsedMilliseconds()
   spHp(k) = spHp(k) - 1 : spHit(k) = now + 300 : score = score + 25
@@ -277,6 +312,7 @@ Procedure HitSpecial(k)
   EndIf
 EndProcedure
 
+; Fred loses a life (short invulnerability) or the game is over
 Procedure HurtPlayer()
   Protected now = ElapsedMilliseconds()
   lives = lives - 1
@@ -285,6 +321,7 @@ Procedure HurtPlayer()
   If lives <= 0 : EndGame(#St_Over) : Else : Say(StringField(quotes$, Random(7) + 1, "|")) : EndIf
 EndProcedure
 
+; Fred fires a bullet if one is free
 Procedure Fire()
   Protected i
   For i = 0 To #MAX_SHOTS - 1
@@ -298,6 +335,7 @@ Procedure Fire()
 EndProcedure
 
 ; ---------- game logic (one tick) ----------
+; game logic for one step: input, armada, special enemies, lightning, bullets, bombs, end of wave
 Procedure Update()
   Protected i, k, r, c, x, y, sp.f, tf.f, now = ElapsedMilliseconds()
 
@@ -409,49 +447,153 @@ Procedure Update()
   EndIf
 EndProcedure
 
-; ---------- rendering ----------
-Procedure CenterText(y, text$, color)
-  DrawText((#SW - TextWidth(text$)) / 2, y, text$, color)
+; ---------- rendering: sprites only while playing ----------
+; StartDrawing(SpriteOutput()) is used ONCE per text or shape, to fill a sprite. After that, only sprites are displayed.
+; builds the solid colour sprites, the title panel, the chat panel and the shield ring
+Procedure BuildSprites()
+  Protected i, c
+  CreateImage(#Img_Measure, 1, 1)
+  For i = 0 To 7
+    Select i
+      Case 0 : c = RGB(120, 255, 90)
+      Case 1 : c = RGB(255, 80, 80)
+      Case 2 : c = RGB(120, 255, 255)
+      Case 3 : c = RGB(50, 50, 80)
+      Case 4 : c = RGB(255, 240, 120)
+      Case 5 : c = RGB(130, 210, 255)
+      Case 6 : c = RGB(255, 255, 255)
+      Default : c = RGB(120, 180, 255)
+    EndSelect
+    CreateSprite(#Spr_Solid + i, 8, 8)
+    StartDrawing(SpriteOutput(#Spr_Solid + i)) : Box(0, 0, 8, 8, c) : StopDrawing()
+  Next
+  CreateSprite(#Spr_Title, 761, 507, #PB_Sprite_AlphaBlending)         ; title screen panel
+  StartDrawing(SpriteOutput(#Spr_Title))
+  DrawingMode(#PB_2DDrawing_AllChannels)
+  Box(0, 0, 761, 507, RGBA(0, 0, 0, 0))
+  Box(0, 0, 760, 506, RGBA(4, 6, 28, 205))
+  For i = 1 To 4 : Line(10, 46 + 64 * i, 740, 0, RGBA(28, 46, 102, 230)) : Next
+  Line(0, 0, 760, 0, RGBA(60, 120, 255, 255)) : Line(0, 506, 760, 0, RGBA(60, 120, 255, 255))
+  Line(0, 0, 0, 506, RGBA(60, 120, 255, 255)) : Line(760, 0, 0, 506, RGBA(60, 120, 255, 255))
+  StopDrawing()
+  CreateSprite(#Spr_Chat, 520, 256, #PB_Sprite_AlphaBlending)          ; chat panel
+  StartDrawing(SpriteOutput(#Spr_Chat))
+  DrawingMode(#PB_2DDrawing_AllChannels)
+  Box(0, 0, 520, 256, RGBA(0, 0, 0, 0))
+  RoundBox(0, 0, 520, 256, 10, 10, RGBA(60, 120, 255, 255))
+  RoundBox(1, 1, 518, 254, 9, 9, RGBA(8, 10, 34, 255))
+  StopDrawing()
+  CreateSprite(#Spr_Ring, 92, 92, #PB_Sprite_AlphaBlending)            ; shield ring
+  StartDrawing(SpriteOutput(#Spr_Ring))
+  DrawingMode(#PB_2DDrawing_AllChannels)
+  Box(0, 0, 92, 92, RGBA(0, 0, 0, 0))
+  Circle(46, 46, 45, RGBA(200, 235, 255, 255)) : Circle(46, 46, 44, RGBA(120, 200, 255, 255)) : Circle(46, 46, 43, RGBA(0, 0, 0, 0))
+  StopDrawing()
 EndProcedure
 
+; frees all the cached text sprites
+Procedure FlushCache()
+  ForEach tc() : FreeSprite(tc()) : Next
+  ClearMap(tc())
+  nextSpr = #Spr_Cache
+EndProcedure
+
+; sprite of a text: rendered the first time it is needed, then reused
+Procedure GetText(font, text$, color)
+  Protected key$ = text$ + "|" + Str(font) + "|" + Str(color), w, h, spr
+  If FindMapElement(tc(), key$) : ProcedureReturn tc() : EndIf
+  If MapSize(tc()) >= #CACHE_MAX : FlushCache() : EndIf
+  StartDrawing(ImageOutput(#Img_Measure))
+  DrawingFont(FontID(font))
+  w = TextWidth(text$) : h = TextHeight(text$)
+  StopDrawing()
+  If w < 1 : w = 1 : EndIf
+  spr = nextSpr : nextSpr = nextSpr + 1
+  CreateSprite(spr, w, h, #PB_Sprite_AlphaBlending)
+  StartDrawing(SpriteOutput(spr))
+  DrawingMode(#PB_2DDrawing_AllChannels)
+  Box(0, 0, w, h, RGBA(0, 0, 0, 0))
+  DrawingFont(FontID(font))
+  DrawText(0, 0, text$, RGBA(Red(color), Green(color), Blue(color), 255), RGBA(0, 0, 0, 0))
+  StopDrawing()
+  tc(key$) = spr
+  ProcedureReturn spr
+EndProcedure
+
+; displays a text at x, y (its sprite comes from the cache)
+Procedure Txt(font, x, y, text$, color)
+  DisplayTransparentSprite(GetText(font, text$, color), x, y)
+EndProcedure
+
+; displays a text horizontally centered on the screen
+Procedure CTxt(font, y, text$, color)
+  Protected spr = GetText(font, text$, color)
+  DisplayTransparentSprite(spr, (#SW - SpriteWidth(spr)) / 2, y)
+EndProcedure
+
+; rectangle: a solid sprite zoomed to the wanted size (cells: 0 shot, 1 red, 2 cyan, 3 dark, 4 spark, 5 bolt, 6 white, 7 warning)
+Procedure FillRect(cell, x, y, w, h)
+  If w > 0 And h > 0
+    ZoomSprite(#Spr_Solid + cell, w, h)
+    DisplaySprite(#Spr_Solid + cell, x, y)
+  EndIf
+EndProcedure
+
+; one line of the enemy list on the title screen
 Procedure TitleRow(i, name$, info$, desc$)
   Protected y = 112 + i * 64
-  DrawText(110, y + 6, name$, RGB(60, 255, 160))
-  DrawText(300, y + 6, info$, RGB(255, 210, 40))
-  DrawText(110, y + 30, desc$, RGB(150, 170, 255))
+  Txt(0, 110, y + 6, name$, cGreen)
+  Txt(0, 300, y + 6, info$, cYellow)
+  Txt(0, 110, y + 30, desc$, cBlue)
 EndProcedure
 
-; one chat bubble (who: 0 = AI, 1 = Fred), returns the y of the next bubble
-Procedure Bubble(who, text$, y)
-  Protected i, n = CountString(text$, "|") + 1, w, t, h, x, col, lc, tc, lab$
+; sprite of a chat bubble (who: 0 = AI, 1 = Fred): rounded box + text lines, rendered once
+Procedure GetBubble(who, text$)
+  Protected key$ = "B|" + Str(who) + "|" + text$, i, n = CountString(text$, "|") + 1, w, t, h, lh, spr, bg, fg
+  If FindMapElement(tc(), key$) : ProcedureReturn tc() : EndIf
+  If MapSize(tc()) >= #CACHE_MAX : FlushCache() : EndIf
+  StartDrawing(ImageOutput(#Img_Measure))
+  DrawingFont(FontID(2))
+  lh = TextHeight("Ag")
   For i = 1 To n
     t = TextWidth(StringField(text$, i, "|"))
     If t > w : w = t : EndIf
   Next
-  w = w + 20 : h = n * 18 + 10
-  If who = 0
-    x = 172 : col = RGB(244, 244, 250) : lc = RGB(190, 140, 255) : tc = RGB(25, 25, 45) : lab$ = "AI"
-  Else
-    x = 668 - w : col = RGB(18, 80, 70) : lc = RGB(60, 255, 160) : tc = RGB(255, 255, 255) : lab$ = "FRED"
-  EndIf
-  DrawingMode(#PB_2DDrawing_Default)
-  RoundBox(x, y + 16, w, h, 8, 8, col)
-  DrawingMode(#PB_2DDrawing_Transparent)
-  DrawText(x, y, lab$, lc)
-  For i = 1 To n : DrawText(x + 10, y + 21 + (i - 1) * 18, StringField(text$, i, "|"), tc) : Next
+  StopDrawing()
+  w = w + 20 : h = n * lh + 10
+  If who = 0 : bg = RGB(244, 244, 250) : fg = RGB(25, 25, 45) : Else : bg = RGB(18, 80, 70) : fg = RGB(255, 255, 255) : EndIf
+  spr = nextSpr : nextSpr = nextSpr + 1
+  CreateSprite(spr, w, h, #PB_Sprite_AlphaBlending)
+  StartDrawing(SpriteOutput(spr))
+  DrawingMode(#PB_2DDrawing_AllChannels)
+  Box(0, 0, w, h, RGBA(0, 0, 0, 0))
+  RoundBox(0, 0, w, h, 8, 8, RGBA(Red(bg), Green(bg), Blue(bg), 255))
+  DrawingFont(FontID(2))
+  For i = 1 To n
+    DrawText(10, 5 + (i - 1) * lh, StringField(text$, i, "|"), RGBA(Red(fg), Green(fg), Blue(fg), 255), RGBA(Red(bg), Green(bg), Blue(bg), 255))
+  Next
+  StopDrawing()
+  tc(key$) = spr
+  ProcedureReturn spr
+EndProcedure
+
+; (the bubble is displayed before the label: GetText may flush the cache, which would free the bubble sprite)
+; one chat bubble with its label, returns the y of the next bubble
+Procedure Bubble(who, text$, y)
+  Protected spr = GetBubble(who, text$), x, h, lab$, lc
+  h = SpriteHeight(spr)
+  If who = 0 : x = 172 : lab$ = "AI" : lc = cLilac : Else : x = 668 - SpriteWidth(spr) : lab$ = "FRED" : lc = cGreen : EndIf
+  DisplayTransparentSprite(spr, x, y + 16)
+  Txt(2, x, y, lab$, lc)
   ProcedureReturn y + 16 + h + 8
 EndProcedure
 
 ; Game Over chat, inspired by the LGTM video: one new message every 1.5 s
 Procedure DrawChat(now)
-  Protected n, y = 226, t = now - overAt - 700, m$, i, h$ = "Hello, Fred. How can I help you today?"
-  DrawingFont(FontID(2))
-  DrawingMode(#PB_2DDrawing_Default)
-  RoundBox(160, 192, 520, 256, 10, 10, RGB(8, 10, 34))
-  DrawingMode(#PB_2DDrawing_Outlined)
-  RoundBox(160, 192, 520, 256, 10, 10, RGB(60, 120, 255))
-  DrawingMode(#PB_2DDrawing_Transparent)
-  DrawText(160 + (520 - TextWidth(h$)) / 2, 198, h$, RGB(120, 150, 255))
+  Protected n, y = 226, t = now - overAt - 700, m$, i, hs, h$ = "Hello, Fred. How can I help you today?"
+  DisplayTransparentSprite(#Spr_Chat, 160, 192)
+  hs = GetText(2, h$, cHead)
+  DisplayTransparentSprite(hs, 160 + (520 - SpriteWidth(hs)) / 2, 198)
   If t >= 0 : n = t / 1500 + 1 : EndIf
   If n > 3 : n = 3 : EndIf
   If state = #St_Over
@@ -463,52 +605,48 @@ Procedure DrawChat(now)
   EndIf
   For i = 1 To n : y = Bubble(Bool(i = 2), StringField(m$, i, "#"), y) : Next
   If n < 3                                         ; typing indicator
-    If n = 1 : DrawText(638, y + 4, Left("...", 1 + ((now / 250) & 1) * 2), RGB(60, 255, 160))
-    Else : DrawText(182, y + 4, Left("...", 1 + ((now / 250) & 1) * 2), RGB(190, 140, 255)) : EndIf
+    If n = 1 : Txt(2, 638, y + 4, Left("...", 1 + ((now / 250) & 1) * 2), cGreen)
+    Else : Txt(2, 182, y + 4, Left("...", 1 + ((now / 250) & 1) * 2), cLilac) : EndIf
   EndIf
-  DrawingFont(FontID(0))
 EndProcedure
 
 ; fake compilation shown at start
 Procedure DrawBoot(now)
-  Protected t = now - bootAt, p, g = RGB(60, 255, 160)
+  Protected t = now - bootAt, p
   p = (t - 500) / 10
   If p < 0 : p = 0 : EndIf
   If p > 100 : p = 100 : EndIf
-  StartDrawing(ScreenOutput())
-  Box(0, 0, #SW, #SH, RGB(4, 6, 18))
-  DrawingMode(#PB_2DDrawing_Transparent)
-  DrawingFont(FontID(0))
-  DrawText(40, 40, "> pbcompiler IA_Invaders.pb", g)
-  If t > 400 : DrawText(40, 80, "Compiling... " + RSet(Str(p), 3) + "% [" + Left("##########", p / 10) + Left("..........", 10 - p / 10) + "]", g) : EndIf
-  If t > 1600 : DrawText(40, 120, "0 errors, 0 warnings, 0 tests.", RGB(150, 170, 255)) : EndIf
-  If t > 2200 : DrawText(40, 160, "Looks Good to Me!", RGB(255, 210, 40)) : EndIf
-  If t > 2600 : DrawText(40, 220, "(Nobody Knows Why!!!)", RGB(80, 114, 255)) : EndIf
-  If t > 3000 : DrawText(40, 260, "_", g) : EndIf
-  StopDrawing()
+  ClearScreen(RGB(4, 6, 18))
+  Txt(0, 40, 40, "> pbcompiler IA_Invaders.pb", cGreen)
+  If t > 400 : Txt(0, 40, 80, "Compiling... " + RSet(Str(p), 3) + "% [" + Left("##########", p / 10) + Left("..........", 10 - p / 10) + "]", cGreen) : EndIf
+  If t > 1600 : Txt(0, 40, 120, "0 errors, 0 warnings, 0 tests.", cBlue) : EndIf
+  If t > 2200 : Txt(0, 40, 160, "Looks Good to Me!", cYellow) : EndIf
+  If t > 2600 : Txt(0, 40, 220, "(Nobody Knows Why!!!)", cDBlue) : EndIf
+  If t > 3000 : Txt(0, 40, 260, "_", cGreen) : EndIf
 EndProcedure
 
+; draws everything for the current state: only sprites are displayed here
 Procedure Draw()
   Protected r, c, i, j, k, f, a, by, y, x0, x1, mx, vis, now = ElapsedMilliseconds()
+  ; boot screen: fake compilation, nothing else to draw
   If state = #St_Boot : DrawBoot(now) : ProcedureReturn : EndIf
+  ; background
   DisplaySprite(#Spr_BG, 0, 0)
 
   If state = #St_Title
-    StartDrawing(ScreenOutput())
-    DrawingMode(#PB_2DDrawing_AlphaBlend)
-    Box(20, 64, 760, 506, RGBA(4, 6, 28, 205))
-    Line(20, 64, 760, 0, RGBA(60, 120, 255, 255)) : Line(20, 570, 760, 0, RGBA(60, 120, 255, 255))
-    Line(20, 64, 0, 506, RGBA(60, 120, 255, 255)) : Line(780, 64, 0, 506, RGBA(60, 120, 255, 255))
-    For i = 1 To 4 : Line(30, 110 + i * 64, 740, 0, RGBA(60, 100, 200, 110)) : Next
-    StopDrawing()
+    ; title screen: panel and enemy icons
+    DisplayTransparentSprite(#Spr_Title, 20, 64)
     For i = 0 To 4
       ClipSprite(#Spr_Enemies, i * 64, ((now / 400) & 1) * 48, 64, 48)
       DisplayTransparentSprite(#Spr_Enemies, 34, 120 + i * 64)
     Next
   ElseIf state = #St_Over Or state = #St_Win
+    ; game over / victory: Fred, sad or normal
     ClipSprite(#Spr_Player, Bool(state = #St_Over) * 192, 0, 64, 72)
     DisplayTransparentSprite(#Spr_Player, 48, 284)
   ElseIf state = #St_Play
+    ; gameplay: armada, special enemies, explosions, Fred, bullets and effects
+    ; armada (the damaged Code Knot is semi-transparent)
     For r = 0 To #ROWS - 1
       For c = 0 To #COLS - 1
         If hp(r, c)
@@ -518,6 +656,7 @@ Procedure Draw()
         EndIf
       Next
     Next
+    ; CEO Cash and MegaCenter (they blink when hit)
     For k = 0 To 1
       If spOn(k)
         vis = Bool(now >= spHit(k) Or ((now / 50) & 1) = 0)
@@ -527,99 +666,99 @@ Procedure Draw()
         EndIf
       EndIf
     Next
+    ; explosions
     For i = 0 To 31
       If boom(i)\t > now
         ClipSprite(#Spr_Enemies, boom(i)\kind * 64, 96, 64, 48)
         DisplayTransparentSprite(#Spr_Enemies, boom(i)\x, boom(i)\y)
       EndIf
     Next
+    ; rubber duck, and the Bug flying back to the armada (Fixed by AI)
     If duckOn : ClipSprite(#Spr_Enemies, 320, 0, 64, 48) : DisplayTransparentSprite(#Spr_Enemies, duckX, duckY) : EndIf
     If rbOn : ClipSprite(#Spr_Enemies, 0, ((now / 100) & 1) * 48, 64, 48) : DisplayTransparentSprite(#Spr_Enemies, rbX, rbY) : EndIf
-    If state = #St_Play
-      f = 0 : by = #PLAYER_Y
-      If moving And ((now / 90) & 1) = 1 : by = by + 3 : EndIf
-      If now < hitUntil : f = 2 : ElseIf now < fireUntil : f = 1 : EndIf
-      If now >= invUntil Or ((now / 90) & 1) = 0
-        ClipSprite(#Spr_Player, f * 64, 0, 64, 72)
-        DisplayTransparentSprite(#Spr_Player, px, by)
-      EndIf
+    ; Fred: idle, firing or hit frame, small bounce when moving, blinks while invulnerable
+    f = 0 : by = #PLAYER_Y
+    If moving And ((now / 90) & 1) = 1 : by = by + 3 : EndIf
+    If now < hitUntil : f = 2 : ElseIf now < fireUntil : f = 1 : EndIf
+    If now >= invUntil Or ((now / 90) & 1) = 0
+      ClipSprite(#Spr_Player, f * 64, 0, 64, 72)
+      DisplayTransparentSprite(#Spr_Player, px, by)
     EndIf
-  EndIf
-
-  StartDrawing(ScreenOutput())
-  If state = #St_Play
-    For i = 0 To #MAX_SHOTS - 1 : If shot(i)\act : Box(shot(i)\x, shot(i)\y, 4, 14, RGB(120, 255, 90)) : EndIf : Next
+    ; Fred bullets and enemy bombs (cyan = hallucination)
+    For i = 0 To #MAX_SHOTS - 1 : If shot(i)\act : FillRect(0, shot(i)\x, shot(i)\y, 4, 14) : EndIf : Next
     For i = 0 To 15
-      If bomb(i)\act : a = RGB(255, 80, 80) : If bomb(i)\act > 1 : a = RGB(120, 255, 255) : EndIf : Box(bomb(i)\x, bomb(i)\y, 6, 14, a) : EndIf
+      If bomb(i)\act : a = 1 : If bomb(i)\act > 1 : a = 2 : EndIf : FillRect(a, bomb(i)\x, bomb(i)\y, 6, 14) : EndIf
     Next
-    If now < shieldUntil And (shieldUntil - now > 1200 Or ((now / 100) & 1) = 1)
-      DrawingMode(#PB_2DDrawing_Outlined) : Circle(px + 32, #PLAYER_Y + 40, 44, RGB(120, 200, 255)) : Circle(px + 32, #PLAYER_Y + 40, 45, RGB(200, 235, 255))
-      DrawingMode(#PB_2DDrawing_Default)
-    EndIf
+    ; rubber duck shield
+    If now < shieldUntil And (shieldUntil - now > 1200 Or ((now / 100) & 1) = 1) : DisplayTransparentSprite(#Spr_Ring, px - 14, #PLAYER_Y - 6) : EndIf
+    ; hit points and impact sparks of the special enemies
     For k = 0 To 1
       If spOn(k)
         If k = #SP_CASH : mx = #CASH_HITS : Else : mx = #MEGA_HITS : EndIf
         For j = 1 To mx                                ; hit points
-          If j <= spHp(k) : a = RGB(255, 80, 80) : Else : a = RGB(50, 50, 80) : EndIf
-          Box(spX(k) + 32 - mx * 8 + (j - 1) * 16, spY(k) + 44, 12, 5, a)
+          If j <= spHp(k) : a = 1 : Else : a = 3 : EndIf
+          FillRect(a, spX(k) + 32 - mx * 8 + (j - 1) * 16, spY(k) + 44, 12, 5)
         Next
         If now < spHit(k)                              ; impact sparks
-          For j = 1 To 8 : Box(spX(k) + Random(60), spY(k) + 8 + Random(30), 4, 4, RGB(255, 240, 120)) : Next
+          For j = 1 To 8 : FillRect(4, spX(k) + Random(60), spY(k) + 8 + Random(30), 4, 4) : Next
         EndIf
       EndIf
     Next
+    ; MegaCenter lightning: warning line, then the strike
     If bState = 1
-      For y = spY(#SP_MEGA) + 44 To #SH Step 20 : Line(bX, y, 0, 8, RGB(120, 180, 255)) : Next
+      For y = spY(#SP_MEGA) + 44 To #SH Step 20 : FillRect(7, bX, y, 2, 8) : Next
     ElseIf bState = 2
       x0 = bX
       For y = spY(#SP_MEGA) + 44 To #SH Step 22
         x1 = bX + Random(28) - 14
-        Line(x0, y, x1 - x0, 22, RGB(130, 210, 255)) : Line(x0 + 1, y, x1 - x0, 22, RGB(255, 255, 255))
+        If x1 < x0 : a = x1 : j = x0 - x1 : Else : a = x0 : j = x1 - x0 : EndIf
+        FillRect(5, a - 3, y, j + 7, 7) : FillRect(5, x1 - 3, y, 7, 22)
+        FillRect(6, a - 1, y + 2, j + 3, 3) : FillRect(6, x1 - 1, y, 3, 22)
         x0 = x1
       Next
     EndIf
   EndIf
-  DrawingMode(#PB_2DDrawing_Transparent)
-  DrawingFont(FontID(0))
+
+  ; HUD: score, level, hi-score, lives, wave and the message line
   If state <> #St_Title
-    DrawText(16, 8, "SCORE " + RSet(Str(score), 7, "0"), RGB(60, 255, 160))
-    DrawText(330, 8, "LEVEL " + Str(wave), RGB(150, 170, 255))
-    DrawText(560, 8, "HI-SCORE " + RSet(Str(hiscore), 7, "0"), RGB(255, 210, 40))
-    DrawText(16, #SH - 28, "FRED x " + Str(lives), RGB(255, 255, 255))
-    DrawText(#SW - 200, #SH - 28, "WAVE " + Str(wave) + "/" + Str(#MAX_WAVE), RGB(60, 255, 160))
-    If now < msgUntil : CenterText(#SH - 28, msg$, RGB(255, 235, 90)) : EndIf
+    Txt(0, 16, 8, "SCORE " + RSet(Str(score), 7, "0"), cGreen)
+    Txt(0, 330, 8, "LEVEL " + Str(wave), cBlue)
+    Txt(0, 560, 8, "HI-SCORE " + RSet(Str(hiscore), 7, "0"), cYellow)
+    Txt(0, 16, #SH - 28, "FRED x " + Str(lives), cWhite)
+    Txt(0, #SW - 200, #SH - 28, "WAVE " + Str(wave) + "/" + Str(#MAX_WAVE), cGreen)
+    If now < msgUntil : CTxt(0, #SH - 28, msg$, cMsg) : EndIf
   EndIf
-  DrawingFont(FontID(1))
+  ; big titles
   Select state
-    Case #St_Title : CenterText(14, "IA Invaders", RGB(60, 255, 160))
-    Case #St_Over : CenterText(76, "Game Over dear Developper!", RGB(255, 80, 80))
-    Case #St_Win : CenterText(76, "LGTM!  Shipped to Prod", RGB(60, 255, 160))
+    Case #St_Title : CTxt(1, 14, "IA Invaders", cGreen)
+    Case #St_Over : CTxt(1, 76, "Game Over dear Developper!", cRed)
+    Case #St_Win : CTxt(1, 76, "LGTM!  Shipped to Prod", cGreen)
   EndSelect
-  DrawingFont(FontID(0))
+  ; texts of the title screen, and of the Game Over / victory screens (with the chat)
   Select state
     Case #St_Title
-      CenterText(70, "Looks Good to Me. It compiles. It passes. Nobody knows why!", RGB(150, 170, 255))
+      CTxt(0, 70, "Looks Good to Me. It compiles. It passes. Nobody knows why!", cBlue)
       TitleRow(0, "BUG", Str(#PTS_BUG) + " pts - 1 hit", "Bug. Squash it. It can reappear due to a fake AI fix")
       TitleRow(1, "CODE KNOT", Str(#PTS_KNOT) + " pts - 2 hits", "Spaghetti code: needs a refactor.")
       TitleRow(2, "GIT COMMIT", Str(#PTS_COMMIT) + " pts - 1 hit", "Merge conflict: armada speeds up! Cyan shots: fake.")
       TitleRow(3, "CEO CASH $$$", Str(#PTS_CASH) + " pts - " + Str(#CASH_HITS) + " hits", "Kill it: armada UP 1 line! Catch the duck for a 6s shield")
       TitleRow(4, "MEGACENTER", Str(#PTS_MEGA) + " pts - " + Str(#MEGA_HITS) + " hits", "Lightning! Escape: armada DOWN 1 line!")
-      CenterText(436, "ARROWS = move    SPACE = fire    ESC = quit", RGB(255, 255, 255))
-      CenterText(484, "Kill the CEO, catch the RUBBER DUCK = shield!", RGB(255, 210, 40))
-      CenterText(540, "HI-SCORE " + RSet(Str(hiscore), 7, "0"), RGB(255, 210, 40))
+      CTxt(0, 436, "ARROWS = move    SPACE = fire    ESC = quit", cWhite)
+      CTxt(0, 484, "Kill the CEO, catch the RUBBER DUCK = shield!", cYellow)
+      CTxt(0, 540, "HI-SCORE " + RSet(Str(hiscore), 7, "0"), cYellow)
     Case #St_Over, #St_Win
-      CenterText(150, "FINAL SCORE " + RSet(Str(score), 7, "0"), RGB(255, 255, 255))
+      CTxt(0, 150, "FINAL SCORE " + RSet(Str(score), 7, "0"), cWhite)
       DrawChat(now)
   EndSelect
+  ; blinking PRESS SPACE
   If state <> #St_Play And ((now / 500) & 1) = 1
     by = 516 : If state = #St_Over Or state = #St_Win : by = 512 : EndIf
-    CenterText(by, "PRESS SPACE", RGB(60, 255, 160))
+    CTxt(0, by, "PRESS SPACE", cGreen)
   EndIf
-  StopDrawing()
 EndProcedure
 
 ; ---------- main ----------
-Define ev, quit, t0, wt$ = "IA Invaders - PurePunch Halloween 2026"
+Define ev, quit, now, last, ticks, acc.f, wt$ = "IA Invaders - PurePunch Halloween 2026"
 
 
 UsePNGImageDecoder()
@@ -639,6 +778,10 @@ Need(CatchSprite(#Spr_Player, ?player, #PB_Sprite_AlphaBlending), "player.png")
 LoadFont(0, "Courier New", DesktopUnscaledX(14), #PB_Font_Bold)
 LoadFont(1, "Courier New", DesktopUnscaledX(36), #PB_Font_Bold)
 LoadFont(2, "Comic Sans MS", DesktopUnscaledX(11))
+cGreen = RGB(60, 255, 160) : cBlue = RGB(150, 170, 255) : cYellow = RGB(255, 210, 40) : cWhite = RGB(255, 255, 255)
+cMsg = RGB(255, 235, 90) : cDBlue = RGB(80, 114, 255) : cRed = RGB(255, 80, 80) : cLilac = RGB(190, 140, 255) : cHead = RGB(120, 150, 255)
+nextSpr = #Spr_Cache
+BuildSprites()
 
 hasSound = InitSound()
 If hasSound
@@ -650,27 +793,32 @@ If hasSound
   EndIf
 EndIf
 
-quotes$ = "REGRESSION DETECTED!|WORKS ON MY MACHINE|IT WAS WORKING YESTERDAY|TRY TURNING IT OFF AND ON AGAIN"
-quotes$ = quotes$ + "|NOT A BUG, IT'S A FEATURE|SEGFAULT (CORE DUMPED)|STACK OVERFLOW... AGAIN|YOU'RE ABSOLUTELY RIGHT!"
+quotes$ = "REGRESSION DETECTED!|WORKS ON MY MACHINE|IT WAS WORKING YESTERDAY|TRY TURNING IT OFF AND ON AGAIN" +
+          "|NOT A BUG, IT'S A FEATURE|SEGFAULT (CORE DUMPED)|STACK OVERFLOW... AGAIN|YOU'RE ABSOLUTELY RIGHT!"
 state = #St_Boot : bootAt = ElapsedMilliseconds()
+last = ElapsedMilliseconds()
 Repeat
-  t0 = ElapsedMilliseconds()
+  now = ElapsedMilliseconds() : acc = acc + (now - last) : last = now        ; time elapsed since the previous loop
+  If acc > 250 : acc = 250 : EndIf                                           ; after a long pause (window dragged...) do not catch up
   Repeat
     ev = WindowEvent()
     If ev = #PB_Event_CloseWindow : quit = #True : EndIf
   Until ev = 0
   ExamineKeyboard()
   If KeyboardPushed(#PB_Key_Escape) : quit = #True : EndIf
-  If state = #St_Play
-    Update()
-  ElseIf state = #St_Boot
+  If state = #St_Boot
     If ElapsedMilliseconds() - bootAt > 3400 Or KeyboardPushed(#PB_Key_Space) : state = #St_Title : lock = ElapsedMilliseconds() + 300 : EndIf
-  ElseIf KeyboardPushed(#PB_Key_Space) And ElapsedMilliseconds() > lock
+  ElseIf state <> #St_Play And KeyboardPushed(#PB_Key_Space) And ElapsedMilliseconds() > lock
     NewGame()
   EndIf
+  ticks = 0
+  While acc >= #TICK_MS                                                      ; fixed time step: the game logic always advances by 1/60 s
+    If state = #St_Play : Update() : EndIf
+    acc = acc - #TICK_MS : ticks = ticks + 1
+  Wend
   Draw()
   FlipBuffers()
-  While ElapsedMilliseconds() - t0 < 16 : Delay(1) : Wend
+  If ticks = 0 : Delay(1) : EndIf                                            ; nothing to compute yet (vsync off): let the CPU rest
 Until quit
 
 ; resources embedded in the executable (the files must be next to this source when compiling)
@@ -684,8 +832,7 @@ DataSection
 EndDataSection
 
 ; IDE Options = PureBasic 6.41 (Windows - x64)
-; CursorPosition = 21
-; Folding = -----
+; Folding = ------
 ; Optimizer
 ; EnableXP
 ; DPIAware
@@ -693,9 +840,9 @@ EndDataSection
 ; Executable = IA_Invaders.exe
 ; Compiler = PureBasic 6.41 - C Backend (Windows - x64)
 ; IncludeVersionInfo
-; VersionField0 = 1.0.0.0
-; VersionField1 = 1.0.0.0
+; VersionField0 = 1.2.0.0
+; VersionField1 = 12.0.0
 ; VersionField2 = ChrisR
 ; VersionField3 = IA Invaders
-; VersionField5 = 1.0
+; VersionField5 = 1.2
 ; VersionField6 = IA Invaders
