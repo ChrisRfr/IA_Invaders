@@ -15,4 +15,4 @@ A Space Invaders clone with an LGTM (Looks Good to Me) twist. The armada of Bugs
 
 ***100 % pure PureBasic***, no API, no external library, made for PurePunch Halloween 2026. **It compiles, it passes, 0 tests, nobody knows why!**  
 <br>
-![IA Invaders](/IA_Invaders_Plaquette.png?raw=true "IA Invaders")<br>
+![IA Invaders](/Plaquette/IA_Invaders_Plaquette.png?raw=true "IA Invaders")<br>
